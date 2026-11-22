@@ -1,0 +1,410 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'KMEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.keymapper"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.keymapper"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          KMEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'KMEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Gamepad Mapper"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".MapperService"
+                      android:exported="false"
+                      android:label="Gamepad Mapper"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          KMEOF
+          mkdir -p app/src/main/java/com/example/keymapper
+          cat > app/src/main/java/com/example/keymapper/MainActivity.kt <<'KMEOF'
+          package com.example.keymapper
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.KeyEvent
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var store: MappingStore
+              private lateinit var status: TextView
+              private lateinit var list: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  store = MappingStore(this)
+
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad * 2, pad, pad)
+
+                  fun label(text: String, size: Float): TextView {
+                      val t = TextView(this)
+                      t.text = text
+                      t.textSize = size
+                      t.setPadding(0, pad / 2, 0, pad / 2)
+                      return t
+                  }
+
+                  fun button(text: String, action: () -> Unit): Button {
+                      val b = Button(this)
+                      b.text = text
+                      b.setOnClickListener { action() }
+                      return b
+                  }
+
+                  root.addView(label("محاكي أزرار يد التحكم", 24f))
+                  status = label("", 16f)
+                  root.addView(status)
+                  root.addView(button("1) تفعيل الخدمة في إعدادات إمكانية الوصول") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  root.addView(button("2) تشغيل / إيقاف وضع التعديل") { toggleEdit() })
+                  root.addView(
+                      label(
+                          "طريقة التعيين: شغّل وضع التعديل، افتح اللعبة، اضغط زرًا في اليد، " +
+                              "ثم المس على الشاشة مكان الزر الذي تريده. كرر لكل زر، ثم أوقف وضع التعديل.",
+                          14f
+                      )
+                  )
+                  list = label("", 16f)
+                  root.addView(list)
+                  root.addView(button("مسح كل الأزرار") {
+                      store.clear()
+                      refresh()
+                  })
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              private fun toggleEdit() {
+                  val service = MapperService.instance
+                  if (service == null) {
+                      Toast.makeText(this, "فعّل الخدمة أولاً", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  val on = service.toggleEdit()
+                  val msg = if (on) "وضع التعديل شغال" else "وضع التعديل متوقف"
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val service = MapperService.instance
+                  status.text = when {
+                      service == null -> "الخدمة: غير مفعّلة"
+                      service.editMode -> "الخدمة: مفعّلة — وضع التعديل شغال"
+                      else -> "الخدمة: مفعّلة"
+                  }
+                  val all = store.all()
+                  list.text = if (all.isEmpty()) {
+                      "لا توجد أزرار محفوظة"
+                  } else {
+                      all.joinToString("\n") {
+                          KeyEvent.keyCodeToString(it.code) + "  ->  (" + it.x.toInt() + ", " + it.y.toInt() + ")"
+                      }
+                  }
+              }
+          }
+          KMEOF
+          mkdir -p app/src/main/java/com/example/keymapper
+          cat > app/src/main/java/com/example/keymapper/MapperService.kt <<'KMEOF'
+          package com.example.keymapper
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.view.Gravity
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MapperService : AccessibilityService() {
+
+              companion object {
+                  var instance: MapperService? = null
+
+                  private val BLOCKED = setOf(
+                      KeyEvent.KEYCODE_HOME,
+                      KeyEvent.KEYCODE_BACK,
+                      KeyEvent.KEYCODE_APP_SWITCH,
+                      KeyEvent.KEYCODE_POWER,
+                      KeyEvent.KEYCODE_VOLUME_UP,
+                      KeyEvent.KEYCODE_VOLUME_DOWN,
+                      KeyEvent.KEYCODE_VOLUME_MUTE
+                  )
+              }
+
+              var editMode = false
+                  private set
+
+              private lateinit var store: MappingStore
+              private var overlay: View? = null
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  store = MappingStore(this)
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  removeOverlay()
+                  return super.onUnbind(intent)
+              }
+
+              fun toggleEdit(): Boolean {
+                  editMode = !editMode
+                  if (!editMode) removeOverlay()
+                  return editMode
+              }
+
+              override fun onKeyEvent(event: KeyEvent): Boolean {
+                  val code = event.keyCode
+                  if (code in BLOCKED) return false
+
+                  if (editMode) {
+                      if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                          showOverlay(code)
+                      }
+                      return true
+                  }
+
+                  val mapping = store.get(code) ?: return false
+                  if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                      tap(mapping.x, mapping.y)
+                  }
+                  return true
+              }
+
+              private fun tap(x: Float, y: Float) {
+                  val path = Path()
+                  path.moveTo(x, y)
+                  val stroke = GestureDescription.StrokeDescription(path, 0, 40)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  dispatchGesture(gesture, null, null)
+              }
+
+              private fun showOverlay(code: Int) {
+                  removeOverlay()
+                  val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val view = TextView(this)
+                  view.text = "المس مكان الزر في اللعبة\n" + KeyEvent.keyCodeToString(code)
+                  view.setTextColor(Color.WHITE)
+                  view.setBackgroundColor(0x99000000.toInt())
+                  view.gravity = Gravity.CENTER
+                  view.textSize = 20f
+                  view.setOnTouchListener { _, ev ->
+                      if (ev.action == MotionEvent.ACTION_DOWN) {
+                          store.put(code, ev.rawX, ev.rawY)
+                          removeOverlay()
+                          Toast.makeText(this@MapperService, "تم الحفظ", Toast.LENGTH_SHORT).show()
+                      }
+                      true
+                  }
+                  val params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  wm.addView(view, params)
+                  overlay = view
+              }
+
+              private fun removeOverlay() {
+                  val v = overlay ?: return
+                  overlay = null
+                  try {
+                      val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                      wm.removeView(v)
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          KMEOF
+          mkdir -p app/src/main/java/com/example/keymapper
+          cat > app/src/main/java/com/example/keymapper/MappingStore.kt <<'KMEOF'
+          package com.example.keymapper
+
+          import android.content.Context
+
+          data class Mapping(val code: Int, val x: Float, val y: Float)
+
+          class MappingStore(context: Context) {
+              private val prefs = context.getSharedPreferences("mappings", Context.MODE_PRIVATE)
+
+              fun put(code: Int, x: Float, y: Float) {
+                  prefs.edit().putString("k$code", "$x,$y").apply()
+              }
+
+              fun get(code: Int): Mapping? {
+                  val s = prefs.getString("k$code", null) ?: return null
+                  val parts = s.split(",")
+                  if (parts.size != 2) return null
+                  val x = parts[0].toFloatOrNull() ?: return null
+                  val y = parts[1].toFloatOrNull() ?: return null
+                  return Mapping(code, x, y)
+              }
+
+              fun all(): List<Mapping> {
+                  val result = ArrayList<Mapping>()
+                  for (key in prefs.all.keys) {
+                      val code = key.removePrefix("k").toIntOrNull() ?: continue
+                      get(code)?.let { result.add(it) }
+                  }
+                  return result
+              }
+
+              fun clear() {
+                  prefs.edit().clear().apply()
+              }
+          }
+          KMEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'KMEOF'
+          <resources>
+              <string name="service_desc">يحوّل أزرار يد التحكم أو الكيبورد إلى لمسات على الشاشة.</string>
+          </resources>
+          KMEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/styles.xml <<'KMEOF'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar" />
+          </resources>
+          KMEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'KMEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRequestFilterKeyEvents"
+              android:canPerformGestures="true"
+              android:canRequestFilterKeyEvents="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          KMEOF
+          true
+          cat > build.gradle.kts <<'KMEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KMEOF
+          true
+          cat > gradle.properties <<'KMEOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          KMEOF
+          true
+          cat > settings.gradle.kts <<'KMEOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GamepadMapper"
+          include(":app")
+          KMEOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GamepadMapper-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
