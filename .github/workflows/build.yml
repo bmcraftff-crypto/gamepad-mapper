@@ -121,14 +121,25 @@ jobs:
                   root.addView(button("2) تشغيل / إيقاف وضع التعديل") { toggleEdit() })
                   root.addView(
                       label(
-                          "طريقة التعيين: شغّل وضع التعديل، افتح اللعبة، اضغط زرًا في اليد، " +
-                              "ثم المس على الشاشة مكان الزر الذي تريده. كرر لكل زر، ثم أوقف وضع التعديل.",
+                          "في وضع التعديل افتح اللعبة ثم:\n" +
+                              "- اضغط أي زر في الكيبورد (أو اليد) ثم المس مكان زره على الشاشة.\n" +
+                              "- اضغط W (أو A أو S أو D): المس مركز عصا الحركة ثم نقطة على حافتها.\n" +
+                              "- اضغط سهمًا من الأسهم: المس وسط منطقة فارغة لتحريك الكاميرا ثم نقطة على حافتها.\n" +
+                              "في النهاية أوقف وضع التعديل. الماوس غير مدعوم بعد.",
                           14f
                       )
                   )
+                  root.addView(button("حساسية الكاميرا +") {
+                      store.putSens(store.getSens() + 0.25f)
+                      refresh()
+                  })
+                  root.addView(button("حساسية الكاميرا -") {
+                      store.putSens(store.getSens() - 0.25f)
+                      refresh()
+                  })
                   list = label("", 16f)
                   root.addView(list)
-                  root.addView(button("مسح كل الأزرار") {
+                  root.addView(button("مسح كل الإعدادات") {
                       store.clear()
                       refresh()
                   })
@@ -162,14 +173,20 @@ jobs:
                       service.editMode -> "الخدمة: مفعّلة — وضع التعديل شغال"
                       else -> "الخدمة: مفعّلة"
                   }
-                  val all = store.all()
-                  list.text = if (all.isEmpty()) {
-                      "لا توجد أزرار محفوظة"
-                  } else {
-                      all.joinToString("\n") {
-                          KeyEvent.keyCodeToString(it.code) + "  ->  (" + it.x.toInt() + ", " + it.y.toInt() + ")"
-                      }
+                  val lines = ArrayList<String>()
+                  for (m in store.all()) {
+                      lines.add(KeyEvent.keyCodeToString(m.code) + "  ->  (" + m.x.toInt() + ", " + m.y.toInt() + ")")
                   }
+                  val stick = store.getStick()
+                  if (stick != null) {
+                      lines.add("عصا الحركة: المركز (" + stick.cx.toInt() + ", " + stick.cy.toInt() + ") نصف القطر " + stick.r.toInt())
+                  }
+                  val aim = store.getAim()
+                  if (aim != null) {
+                      lines.add("الكاميرا: المركز (" + aim.cx.toInt() + ", " + aim.cy.toInt() + ") نصف القطر " + aim.r.toInt())
+                  }
+                  lines.add("حساسية الكاميرا: " + store.getSens())
+                  list.text = lines.joinToString("\n")
               }
           }
           KMEOF
@@ -183,7 +200,11 @@ jobs:
           import android.graphics.Color
           import android.graphics.Path
           import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
           import android.view.Gravity
+          import android.view.InputDevice
           import android.view.KeyEvent
           import android.view.MotionEvent
           import android.view.View
@@ -191,11 +212,21 @@ jobs:
           import android.view.accessibility.AccessibilityEvent
           import android.widget.TextView
           import android.widget.Toast
+          import kotlin.math.hypot
+          import kotlin.math.max
 
           class MapperService : AccessibilityService() {
 
               companion object {
                   var instance: MapperService? = null
+
+                  private const val SEG = 40L
+                  private const val STICK_ID = -1
+                  private const val AIM_A = -2
+                  private const val AIM_B = -3
+                  private const val NO_CODE = -999
+                  private const val DEAD_ZONE = 0.25f
+                  private const val AIM_SPEED = 30f
 
                   private val BLOCKED = setOf(
                       KeyEvent.KEYCODE_HOME,
@@ -208,16 +239,50 @@ jobs:
                   )
               }
 
+              private class Pointer(var x: Float, var y: Float, var tx: Float, var ty: Float) {
+                  var prev: GestureDescription.StrokeDescription? = null
+                  var ending = false
+              }
+
               var editMode = false
                   private set
 
               private lateinit var store: MappingStore
               private var overlay: View? = null
+              private var pendingCode = NO_CODE
+              private val handler = Handler(Looper.getMainLooper())
+              private val pointers = LinkedHashMap<Int, Pointer>()
+              private var running = false
+
+              private var stickArmed = false
+              private var aimArmed = false
+              private var aimDx = 0f
+              private var aimDy = 0f
+              private var aimId = AIM_A
+              private var l2Down = false
+              private var r2Down = false
+
+              private var setupKind = 0
+              private var wDown = false
+              private var aDown = false
+              private var sDown = false
+              private var dDown = false
+              private var upDown = false
+              private var downDown = false
+              private var leftDown = false
+              private var rightDown = false
 
               override fun onServiceConnected() {
                   super.onServiceConnected()
                   store = MappingStore(this)
                   instance = this
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      val info = serviceInfo
+                      if (info != null) {
+                          info.motionEventSources = InputDevice.SOURCE_JOYSTICK
+                          serviceInfo = info
+                      }
+                  }
               }
 
               override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -227,56 +292,365 @@ jobs:
               override fun onUnbind(intent: Intent?): Boolean {
                   instance = null
                   removeOverlay()
+                  pointers.clear()
+                  running = false
                   return super.onUnbind(intent)
               }
 
               fun toggleEdit(): Boolean {
                   editMode = !editMode
+                  stickArmed = false
+                  aimArmed = false
                   if (!editMode) removeOverlay()
                   return editMode
               }
 
+              // ---- buttons ----
+
               override fun onKeyEvent(event: KeyEvent): Boolean {
                   val code = event.keyCode
                   if (code in BLOCKED) return false
+                  val down = event.action == KeyEvent.ACTION_DOWN
+                  val up = event.action == KeyEvent.ACTION_UP
 
                   if (editMode) {
-                      if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                          showOverlay(code)
+                      if (down && event.repeatCount == 0) {
+                          if (isMoveKey(code)) {
+                              if (setupKind != 2) showStickSetup()
+                          } else if (isAimKey(code)) {
+                              if (setupKind != 3) showAimSetup()
+                          } else {
+                              buttonDown(code)
+                          }
                       }
                       return true
                   }
 
-                  val mapping = store.get(code) ?: return false
-                  if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                      tap(mapping.x, mapping.y)
+                  if (isMoveKey(code) && store.getStick() != null) {
+                      if (down || up) {
+                          setMoveKey(code, down)
+                          updateKeyStick()
+                      }
+                      return true
+                  }
+                  if (isAimKey(code) && store.getAim() != null) {
+                      if (down || up) {
+                          setAimKey(code, down)
+                          updateKeyAim()
+                      }
+                      return true
+                  }
+
+                  if (store.get(code) == null) return false
+                  if (down) {
+                      if (event.repeatCount == 0) buttonDown(code)
+                  } else if (up) {
+                      buttonUp(code)
                   }
                   return true
               }
 
-              private fun tap(x: Float, y: Float) {
-                  val path = Path()
-                  path.moveTo(x, y)
-                  val stroke = GestureDescription.StrokeDescription(path, 0, 40)
-                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
-                  dispatchGesture(gesture, null, null)
+              private fun isMoveKey(c: Int): Boolean =
+                  c == KeyEvent.KEYCODE_W || c == KeyEvent.KEYCODE_A ||
+                      c == KeyEvent.KEYCODE_S || c == KeyEvent.KEYCODE_D
+
+              private fun isAimKey(c: Int): Boolean =
+                  c == KeyEvent.KEYCODE_DPAD_UP || c == KeyEvent.KEYCODE_DPAD_DOWN ||
+                      c == KeyEvent.KEYCODE_DPAD_LEFT || c == KeyEvent.KEYCODE_DPAD_RIGHT
+
+              private fun setMoveKey(c: Int, v: Boolean) {
+                  when (c) {
+                      KeyEvent.KEYCODE_W -> wDown = v
+                      KeyEvent.KEYCODE_A -> aDown = v
+                      KeyEvent.KEYCODE_S -> sDown = v
+                      KeyEvent.KEYCODE_D -> dDown = v
+                  }
               }
 
-              private fun showOverlay(code: Int) {
+              private fun setAimKey(c: Int, v: Boolean) {
+                  when (c) {
+                      KeyEvent.KEYCODE_DPAD_UP -> upDown = v
+                      KeyEvent.KEYCODE_DPAD_DOWN -> downDown = v
+                      KeyEvent.KEYCODE_DPAD_LEFT -> leftDown = v
+                      KeyEvent.KEYCODE_DPAD_RIGHT -> rightDown = v
+                  }
+              }
+
+              private fun updateKeyStick() {
+                  val stick = store.getStick() ?: return
+                  val x = (if (dDown) 1f else 0f) - (if (aDown) 1f else 0f)
+                  val y = (if (sDown) 1f else 0f) - (if (wDown) 1f else 0f)
+                  if (x == 0f && y == 0f) {
+                      release(STICK_ID)
+                  } else {
+                      val m = hypot(x, y)
+                      press(STICK_ID, stick.cx, stick.cy, stick.cx + x / m * stick.r, stick.cy + y / m * stick.r)
+                  }
+              }
+
+              private fun updateKeyAim() {
+                  val x = (if (rightDown) 1f else 0f) - (if (leftDown) 1f else 0f)
+                  val y = (if (downDown) 1f else 0f) - (if (upDown) 1f else 0f)
+                  if (x == 0f && y == 0f) {
+                      aimDx = 0f
+                      aimDy = 0f
+                  } else {
+                      val m = hypot(x, y)
+                      aimDx = x / m
+                      aimDy = y / m
+                  }
+                  kick()
+              }
+
+              private fun buttonDown(code: Int) {
+                  if (editMode) {
+                      if (!(overlay != null && pendingCode == code)) showButtonSetup(code)
+                      return
+                  }
+                  val m = store.get(code) ?: return
+                  press(code, m.x, m.y, m.x, m.y)
+              }
+
+              private fun buttonUp(code: Int) {
+                  if (!editMode) release(code)
+              }
+
+              // ---- sticks and triggers ----
+
+              override fun onMotionEvent(event: MotionEvent) {
+                  if ((event.source and InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK) return
+
+                  val lx = event.getAxisValue(MotionEvent.AXIS_X)
+                  val ly = event.getAxisValue(MotionEvent.AXIS_Y)
+                  var rx = event.getAxisValue(MotionEvent.AXIS_Z)
+                  var ry = event.getAxisValue(MotionEvent.AXIS_RZ)
+                  val rx2 = event.getAxisValue(MotionEvent.AXIS_RX)
+                  val ry2 = event.getAxisValue(MotionEvent.AXIS_RY)
+                  if (hypot(rx2, ry2) > hypot(rx, ry)) {
+                      rx = rx2
+                      ry = ry2
+                  }
+                  val l2 = max(
+                      event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+                      event.getAxisValue(MotionEvent.AXIS_BRAKE)
+                  )
+                  val r2 = max(
+                      event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
+                      event.getAxisValue(MotionEvent.AXIS_GAS)
+                  )
+
+                  if (l2 > 0.5f && !l2Down) {
+                      l2Down = true
+                      buttonDown(KeyEvent.KEYCODE_BUTTON_L2)
+                  } else if (l2 < 0.3f && l2Down) {
+                      l2Down = false
+                      buttonUp(KeyEvent.KEYCODE_BUTTON_L2)
+                  }
+                  if (r2 > 0.5f && !r2Down) {
+                      r2Down = true
+                      buttonDown(KeyEvent.KEYCODE_BUTTON_R2)
+                  } else if (r2 < 0.3f && r2Down) {
+                      r2Down = false
+                      buttonUp(KeyEvent.KEYCODE_BUTTON_R2)
+                  }
+
+                  val lmag = hypot(lx, ly)
+                  val rmag = hypot(rx, ry)
+
+                  if (editMode) {
+                      if (lmag < 0.2f) stickArmed = true
+                      if (rmag < 0.2f) aimArmed = true
+                      if (overlay == null) {
+                          if (lmag > 0.6f && stickArmed) {
+                              stickArmed = false
+                              showStickSetup()
+                          } else if (rmag > 0.6f && aimArmed) {
+                              aimArmed = false
+                              showAimSetup()
+                          }
+                      }
+                      return
+                  }
+
+                  val stick = store.getStick()
+                  if (stick != null) {
+                      if (lmag < DEAD_ZONE) {
+                          release(STICK_ID)
+                      } else {
+                          val k = if (lmag > 1f) 1f / lmag else 1f
+                          press(STICK_ID, stick.cx, stick.cy, stick.cx + lx * k * stick.r, stick.cy + ly * k * stick.r)
+                      }
+                  }
+
+                  if (rmag < DEAD_ZONE) {
+                      aimDx = 0f
+                      aimDy = 0f
+                  } else {
+                      val k = if (rmag > 1f) 1f / rmag else 1f
+                      aimDx = rx * k
+                      aimDy = ry * k
+                  }
+                  kick()
+              }
+
+              // ---- touch engine: keeps all fingers alive in one continuous gesture stream ----
+
+              private fun press(id: Int, sx: Float, sy: Float, tx: Float, ty: Float) {
+                  val p = pointers[id]
+                  if (p == null) {
+                      if (pointers.size >= 9) return
+                      pointers[id] = Pointer(sx, sy, tx, ty)
+                  } else {
+                      p.tx = tx
+                      p.ty = ty
+                      p.ending = false
+                  }
+                  kick()
+              }
+
+              private fun release(id: Int) {
+                  val p = pointers[id] ?: return
+                  p.ending = true
+                  kick()
+              }
+
+              private fun kick() {
+                  if (!running) {
+                      running = true
+                      tick()
+                  }
+              }
+
+              private fun updateAim() {
+                  val cfg = store.getAim()
+                  val cur = pointers[aimId]
+                  if (cfg == null || (aimDx == 0f && aimDy == 0f)) {
+                      cur?.ending = true
+                      return
+                  }
+                  if (cur == null || cur.ending) {
+                      if (cur != null) aimId = if (aimId == AIM_A) AIM_B else AIM_A
+                      if (pointers.size < 9) pointers[aimId] = Pointer(cfg.cx, cfg.cy, cfg.cx, cfg.cy)
+                      return
+                  }
+                  val speed = AIM_SPEED * store.getSens()
+                  cur.tx += aimDx * speed
+                  cur.ty += aimDy * speed
+                  if (hypot(cur.tx - cfg.cx, cur.ty - cfg.cy) > cfg.r) {
+                      cur.ending = true
+                      aimId = if (aimId == AIM_A) AIM_B else AIM_A
+                      if (pointers.size < 9) pointers[aimId] = Pointer(cfg.cx, cfg.cy, cfg.cx, cfg.cy)
+                  }
+              }
+
+              private fun tick() {
+                  updateAim()
+                  if (pointers.isEmpty()) {
+                      running = false
+                      return
+                  }
+                  val builder = GestureDescription.Builder()
+                  val iterator = pointers.entries.iterator()
+                  while (iterator.hasNext()) {
+                      val p = iterator.next().value
+                      val path = Path()
+                      path.moveTo(p.x, p.y)
+                      if (p.tx != p.x || p.ty != p.y) path.lineTo(p.tx, p.ty)
+                      val cont = !p.ending
+                      val prev = p.prev
+                      val stroke = if (prev == null) {
+                          GestureDescription.StrokeDescription(path, 0, SEG, cont)
+                      } else {
+                          prev.continueStroke(path, 0, SEG, cont)
+                      }
+                      builder.addStroke(stroke)
+                      p.prev = stroke
+                      p.x = p.tx
+                      p.y = p.ty
+                      if (p.ending) iterator.remove()
+                  }
+                  val ok = dispatchGesture(
+                      builder.build(),
+                      object : AccessibilityService.GestureResultCallback() {
+                          override fun onCompleted(gestureDescription: GestureDescription?) {
+                              tick()
+                          }
+
+                          override fun onCancelled(gestureDescription: GestureDescription?) {
+                              pointers.clear()
+                              running = false
+                          }
+                      },
+                      handler
+                  )
+                  if (!ok) {
+                      pointers.clear()
+                      running = false
+                  }
+              }
+
+              // ---- setup overlays ----
+
+              private fun showButtonSetup(code: Int) {
+                  makeOverlay(1, code, "المس مكان الزر في اللعبة\n" + KeyEvent.keyCodeToString(code)) { _, ev ->
+                      store.put(code, ev.rawX, ev.rawY)
+                      pendingCode = NO_CODE
+                      removeOverlay()
+                      Toast.makeText(this, "تم الحفظ", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun showStickSetup() {
+                  pendingCode = NO_CODE
+                  var step = 0
+                  var cx = 0f
+                  var cy = 0f
+                  makeOverlay(2, NO_CODE, "المس مركز عصا الحركة في اللعبة") { view, ev ->
+                      if (step == 0) {
+                          cx = ev.rawX
+                          cy = ev.rawY
+                          step = 1
+                          view.text = "الآن المس نقطة على حافة دائرة العصا"
+                      } else {
+                          val r = max(hypot(ev.rawX - cx, ev.rawY - cy), 40f)
+                          store.putStick(cx, cy, r)
+                          removeOverlay()
+                          Toast.makeText(this, "تم حفظ عصا الحركة", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+
+              private fun showAimSetup() {
+                  pendingCode = NO_CODE
+                  var step = 0
+                  var cx = 0f
+                  var cy = 0f
+                  makeOverlay(3, NO_CODE, "المس وسط منطقة تحريك الكاميرا (مكان فارغ في الجهة اليمنى بعيدًا عن الأزرار)") { view, ev ->
+                      if (step == 0) {
+                          cx = ev.rawX
+                          cy = ev.rawY
+                          step = 1
+                          view.text = "الآن المس نقطة على حافة المنطقة (كلما ابتعدت قلّ انقطاع الكاميرا)"
+                      } else {
+                          val r = max(hypot(ev.rawX - cx, ev.rawY - cy), 60f)
+                          store.putAim(cx, cy, r)
+                          removeOverlay()
+                          Toast.makeText(this, "تم حفظ الكاميرا", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+
+              private fun makeOverlay(kind: Int, code: Int, text: String, onDown: (TextView, MotionEvent) -> Unit) {
                   removeOverlay()
                   val wm = getSystemService(WINDOW_SERVICE) as WindowManager
                   val view = TextView(this)
-                  view.text = "المس مكان الزر في اللعبة\n" + KeyEvent.keyCodeToString(code)
+                  view.text = text
                   view.setTextColor(Color.WHITE)
                   view.setBackgroundColor(0x99000000.toInt())
                   view.gravity = Gravity.CENTER
                   view.textSize = 20f
                   view.setOnTouchListener { _, ev ->
-                      if (ev.action == MotionEvent.ACTION_DOWN) {
-                          store.put(code, ev.rawX, ev.rawY)
-                          removeOverlay()
-                          Toast.makeText(this@MapperService, "تم الحفظ", Toast.LENGTH_SHORT).show()
-                      }
+                      if (ev.action == MotionEvent.ACTION_DOWN) onDown(view, ev)
                       true
                   }
                   val params = WindowManager.LayoutParams(
@@ -289,11 +663,15 @@ jobs:
                   )
                   wm.addView(view, params)
                   overlay = view
+                  setupKind = kind
+                  pendingCode = code
               }
 
               private fun removeOverlay() {
                   val v = overlay ?: return
                   overlay = null
+                  pendingCode = NO_CODE
+                  setupKind = 0
                   try {
                       val wm = getSystemService(WINDOW_SERVICE) as WindowManager
                       wm.removeView(v)
@@ -309,6 +687,8 @@ jobs:
           import android.content.Context
 
           data class Mapping(val code: Int, val x: Float, val y: Float)
+
+          data class Stick(val cx: Float, val cy: Float, val r: Float)
 
           class MappingStore(context: Context) {
               private val prefs = context.getSharedPreferences("mappings", Context.MODE_PRIVATE)
@@ -329,10 +709,45 @@ jobs:
               fun all(): List<Mapping> {
                   val result = ArrayList<Mapping>()
                   for (key in prefs.all.keys) {
+                      if (!key.startsWith("k")) continue
                       val code = key.removePrefix("k").toIntOrNull() ?: continue
                       get(code)?.let { result.add(it) }
                   }
                   return result
+              }
+
+              fun putStick(cx: Float, cy: Float, r: Float) {
+                  prefs.edit().putString("stick", "$cx,$cy,$r").apply()
+              }
+
+              fun getStick(): Stick? {
+                  val s = prefs.getString("stick", null) ?: return null
+                  val parts = s.split(",")
+                  if (parts.size != 3) return null
+                  val cx = parts[0].toFloatOrNull() ?: return null
+                  val cy = parts[1].toFloatOrNull() ?: return null
+                  val r = parts[2].toFloatOrNull() ?: return null
+                  return Stick(cx, cy, r)
+              }
+
+              fun putAim(cx: Float, cy: Float, r: Float) {
+                  prefs.edit().putString("aim", "$cx,$cy,$r").apply()
+              }
+
+              fun getAim(): Stick? {
+                  val s = prefs.getString("aim", null) ?: return null
+                  val parts = s.split(",")
+                  if (parts.size != 3) return null
+                  val cx = parts[0].toFloatOrNull() ?: return null
+                  val cy = parts[1].toFloatOrNull() ?: return null
+                  val r = parts[2].toFloatOrNull() ?: return null
+                  return Stick(cx, cy, r)
+              }
+
+              fun getSens(): Float = prefs.getFloat("sens", 1f)
+
+              fun putSens(v: Float) {
+                  prefs.edit().putFloat("sens", v.coerceIn(0.25f, 4f)).apply()
               }
 
               fun clear() {
